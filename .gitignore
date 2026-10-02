@@ -1,0 +1,17 @@
+# Build output
+/build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+
+# MinHook is fetched by build.bat (git clone --depth 1) when missing.
+/third_party/minhook/
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+*.suo
