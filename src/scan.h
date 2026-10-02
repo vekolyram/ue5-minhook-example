@@ -93,6 +93,41 @@ struct Section {
     char name[9] = {};
 };
 
+// Every section of the image, in header order.
+//
+// Returned by value, with no caching, on purpose. An earlier version memoised
+// this in a `static thread_local` and the worker thread deadlocked on its first
+// access: this DLL is built with the static CRT and disables thread library
+// calls, so a thread created with CreateThread has no CRT thread state for a
+// thread_local with a non-trivial initialiser to bind to. Discovery runs once
+// per process, so caching bought nothing and cost a hang.
+inline std::vector<Section> allSections(const uint8_t* base) {
+    std::vector<Section> out;
+    if (base == nullptr) return out;
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return out;
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return out;
+
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        // In memory the mapped size is VirtualSize; SizeOfRawData is the file
+        // size and can be larger for a section whose tail is zero-filled.
+        const DWORD vsize = sec->Misc.VirtualSize != 0 ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+        if (vsize == 0) continue;
+
+        Section s;
+        s.begin = base + sec->VirtualAddress;
+        s.size = vsize;
+        std::memcpy(s.name, sec->Name, 8);
+        s.name[8] = '\0';
+        out.push_back(s);
+    }
+    return out;
+}
+
 // Executable sections of the image loaded at `base`, in header order.
 inline std::vector<Section> executableSections(const uint8_t* base) {
     std::vector<Section> out;
@@ -107,8 +142,6 @@ inline std::vector<Section> executableSections(const uint8_t* base) {
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
-        // In memory the mapped size is VirtualSize; SizeOfRawData is the file
-        // size and can be larger for a section whose tail is zero-filled.
         const DWORD vsize = sec->Misc.VirtualSize != 0 ? sec->Misc.VirtualSize : sec->SizeOfRawData;
         if (vsize == 0) continue;
 
@@ -120,6 +153,15 @@ inline std::vector<Section> executableSections(const uint8_t* base) {
         out.push_back(s);
     }
     return out;
+}
+
+// The section with this exact name, or nullptr. `sections` must outlive the
+// result.
+inline const Section* findSection(const std::vector<Section>& sections, const char* name) {
+    for (const Section& s : sections) {
+        if (std::strcmp(s.name, name) == 0) return &s;
+    }
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------

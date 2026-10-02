@@ -20,6 +20,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace asynclog {
 
@@ -47,13 +50,20 @@ struct Slot {
 
 class Ring {
 public:
+    // Resolves a UClass pointer to a readable name. Called from the CONSUMER
+    // thread only, never from the detour: walking the name pool is far too
+    // expensive for a function that runs ~1600 times a second.
+    using ClassNameResolver = std::string (*)(const void* cls);
+
     ~Ring() { stop(); }
 
     // `capacity` is rounded up to a power of two. Opens `path` for writing.
     // `header`, when given, is written before the consumer thread starts, so it
     // cannot interleave with drained records.
-    bool start(const wchar_t* path, size_t capacity = 1u << 16, const wchar_t* header = nullptr) {
+    bool start(const wchar_t* path, size_t capacity = 1u << 16, const wchar_t* header = nullptr,
+               ClassNameResolver resolveClass = nullptr) {
         if (running_.load()) return false;
+        resolveClass_ = resolveClass;
 
         size_t cap = 1;
         while (cap < capacity) cap <<= 1;
@@ -146,6 +156,18 @@ public:
         }
     }
 
+    // A free-text line, written synchronously.
+    //
+    // For startup summaries and other rare, human-authored output. It takes the
+    // same lock drain() uses so a note cannot interleave with a record. Never
+    // call this from the detour -- it blocks.
+    void note(const wchar_t* text) {
+        if (file_ == nullptr || text == nullptr) return;
+        std::lock_guard<std::mutex> guard(fileLock_);
+        std::fwprintf(file_, L"%s\n", text);
+        std::fflush(file_);
+    }
+
     uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
     uint64_t written() const { return written_.load(std::memory_order_relaxed); }
 
@@ -188,15 +210,27 @@ private:
 
     void drain() {
         if (file_ == nullptr) return;
+        std::lock_guard<std::mutex> guard(fileLock_);
         Record r;
         int flushed = 0;
         while (pop(r)) {
             std::fwprintf(file_,
                           L"seq=%llu tid=%lu params=%p class=%p outer=%p name=%016llX "
-                          L"flags70=%08X result=%p ret=%p\n",
+                          L"flags70=%08X result=%p ret=%p",
                           static_cast<unsigned long long>(r.seq), r.threadId, r.params, r.cls,
                           r.outer, static_cast<unsigned long long>(r.name), r.flags70, r.result,
                           r.retAddr);
+            if (resolveClass_ != nullptr) {
+                // The same handful of UClasses accounts for almost every call,
+                // so one lookup per distinct pointer is enough.
+                auto it = nameCache_.find(r.cls);
+                if (it == nameCache_.end()) {
+                    it = nameCache_.emplace(r.cls, resolveClass_(r.cls)).first;
+                }
+                std::fwprintf(file_, L" classname=%hs",
+                              it->second.empty() ? "?" : it->second.c_str());
+            }
+            std::fputwc(L'\n', file_);
             written_.fetch_add(1, std::memory_order_relaxed);
             if (++flushed >= 256) {
                 std::fflush(file_);
@@ -211,6 +245,11 @@ private:
     std::FILE* file_ = nullptr;
     HANDLE stopEvent_ = nullptr;
     HANDLE thread_ = nullptr;
+    ClassNameResolver resolveClass_ = nullptr;
+    std::unordered_map<const void*, std::string> nameCache_;
+    // Guards file_ between the consumer thread's batches and note(). Not touched
+    // by the detour.
+    std::mutex fileLock_;
 
     // Both counters share a cache line with nothing else hot: they are written
     // by different threads every call.

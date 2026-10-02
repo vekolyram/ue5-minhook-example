@@ -34,7 +34,9 @@ target_compile_definitions(minhook PRIVATE _CRT_SECURE_NO_WARNINGS)
 # The hook DLL
 # ---------------------------------------------------------------------------
 add_library(ue5hook SHARED src/dllmain.cpp)
-target_include_directories(ue5hook PRIVATE src)
+# src/hde is where MinHook keeps HDE64, the length disassembler src/disasm.h
+# uses to recover globals from a function's instruction stream.
+target_include_directories(ue5hook PRIVATE src "${MH_ROOT}/src/hde")
 target_link_libraries(ue5hook PRIVATE minhook)
 
 # Sources are UTF-8; without this MSVC reads them in the system code page (936
@@ -62,7 +64,7 @@ target_compile_options(injector PRIVATE /utf-8)
 # the detour shape used above.
 # ---------------------------------------------------------------------------
 add_executable(selftest tests/selftest.cpp)
-target_include_directories(selftest PRIVATE src)
+target_include_directories(selftest PRIVATE src "${MH_ROOT}/src/hde")
 target_link_libraries(selftest PRIVATE minhook)
 target_compile_options(selftest PRIVATE /utf-8)
 set_property(TARGET selftest PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")

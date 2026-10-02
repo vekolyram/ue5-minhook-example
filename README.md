@@ -55,23 +55,87 @@
 命中点前 8 字节是 `CC CC CC CC CC CC CC CC`（int3 填充）——真实函数入口的形态，这是
 「签名指向函数开头而不是函数中间的某段字节」的独立佐证。
 
+### 锚点：GUObjectArray 与名称池
+
+拿到 `StaticConstructObject_Internal` 之后，按专栏第 08 章的**路径 1** 继续走：该函数内部
+会引用 `GUObjectArray`，所以从它的指令流里就能把这个全局量捞出来——不必再为
+`GUObjectArray` 写一条特征码，也就不必赌它的布局（而布局恰恰是逐游戏会变的那部分）。
+
+实现用 MinHook 自带的 HDE64 做线性扫描（`src/disasm.h`），收集所有 `lea reg,[rip+disp]` 与
+`mov reg,[rip+disp]` 的目标，再逐个校验候选。校验用的是「错候选不可能同时满足」的一组约束：
+
+| 校验项 | 约束 |
+|---|---|
+| `NumElements` | 1,000 ~ 20,000,000 |
+| `NumChunks` | 必须等于 `ceil(NumElements / 65536)`（允许 +1） |
+| `MaxChunks` / `MaxElements` | 不得小于当前值 |
+| 第一个 chunk 的第一个槽 | 必须是一个可读的 `UObject` |
+
+名称池没法这样走——手上没有「必然引用它」的函数。改用**结构特征**：`Blocks` 是 8192 个指针，
+只有用到的块非空，所以数组尾部是**几千个连续零 qword**（几十 KB）。先找这个零串，再往回数
+非空指针，就得到数组起点。最后用一条不可能被误判的校验收口：
+
+> **条目 0 必须解码成 `"None"`。** `NAME_None` 在所有 UE 构建里都是索引 0，字符串就是 `None`。
+
+实测结果：
+
+```
+GUObjectArray=0x7FF63BBC4050 (RVA 0x91F4050)  elements=96984  chunks=2
+NamePool.blocks=0x7FF63BAE0550 (RVA 0x9110550)  layout=legacy
+```
+
+- `0x7FF63BBC4050` 与 UE4SS 日志里的 `GUObjectArray: 0x7ff63bbc4050` **完全一致**——两条
+  完全独立的路径（这里的反汇编 vs UE4SS 的内置签名）落到同一个地址
+- `chunks=2 = ceil(96984 / 65536)`，自洽
+- 名称池布局探测结果是 `legacy`（`bIsWide:1, ProbeHashBits:5, Len:10`），说明这个构建
+  **没有**启用大小写保留的 FName
+
+锚点拿到之后，端到端验证是枚举 `UWorld` 实例（专栏第 02 章末尾的用法）：
+
+```
+UWorld instances=4
+  Default__World  @00007FF431063500
+  StartingLevel   @0000026804D20150
+  Login           @00000268041D48A0
+  Home            @000002680AED52D0
+most common classes:
+   28783  Function
+    6327  Package
+    5349  ScriptStruct
+    4355  Class
+    2208  BlueprintGeneratedClass
+    2116  OverlaySlot
+    2110  VerticalBoxSlot
+    1875  Enum
+    1715  MovieSceneBuiltInEasingFunction
+    1645  Texture2D
+```
+
+这一条同时证明了整条链路：分块数组遍历、`UObject` 的 `ClassPrivate` / `NamePrivate` 偏移、
+FName 解码——任何一环错了，这里都只会输出空或乱码。类名分布也是教科书式的：`Function`
+最多（每个 `UFunction` 都是一个对象），`Package` / `ScriptStruct` / `Class` 紧随其后；
+`Default__World` 的 `Default__` 前缀正是类默认对象（CDO）的标准命名。
+
 ---
 
 ## 二、目录结构
 
 ```
 ue5-minhook-example/
-├─ build.bat                  一键构建（vcvars64 + cmake + nmake）
+├─ build.bat                  一键构建（vswhere 定位 VS + cmake NMake）
 ├─ CMakeLists.txt
 ├─ src/
-│  ├─ dllmain.cpp             ★ 主示例：定位 → hook → 记录 → 卸载
+│  ├─ dllmain.cpp             ★ 主示例：定位 → hook → 锚点发现 → 记录 → 卸载
 │  ├─ scan.h                  PE 节遍历 + AOB 扫描
-│  ├─ async_log.h             无锁日志环（Vyukov MPMC）+ 消费线程
+│  ├─ disasm.h                HDE64 线性扫描，从函数里捞出全局量
+│  ├─ ue.h                    ★ 锚点发现与校验、FName 解码、对象枚举
+│  ├─ async_log.h             无锁日志环（Vyukov MPMC）+ 消费线程 + 类名缓存
 │  └─ injector.cpp            最小注入器（LoadLibrary / FreeLibrary）
 ├─ tests/
 │  └─ selftest.cpp            验证签名定位与 MinHook 往返
 ├─ tools/
-│  └─ aobscan.mjs             离线扫描器（文件偏移 → RVA）
+│  ├─ aobscan.mjs             离线扫描器（文件偏移 → RVA）
+│  └─ sections.mjs            打印 PE 节大小，用来给扫描耗时定量
 └─ third_party/minhook/       git clone，commit 8af6b4a
 ```
 
@@ -146,13 +210,34 @@ build\bin\injector.exe kards-Win64-Shipping.exe ue5hook.dll --eject
 
 ### 日志格式
 
+启动时先写三行头部，记录定位到的地址（RVA 便于跨运行对比）：
+
 ```
-seq=1234 tid=5678 params=000001F2... class=000001F2... outer=000001F2... name=0000000A0000002F flags70=00000000 result=000001F2... ret=00007FF6...
+# ue5hook  module=<exe>  RVA=0x15C6C80  section=.text  via=fallback (...)
+  GUObjectArray=0x7FF63BBC4050 (RVA 0x91F4050)  elements=96984  chunks=2
+  NamePool.blocks=0x7FF63BAE0550 (RVA 0x9110550)  layout=legacy
+  UWorld instances=4
+    Default__World  @00007FF431063500
+    ...
+  most common classes:
+     28783  Function
+     ...
 ```
 
-`class` / `outer` / `name` / `flags70` 都是从 `params` 里按偏移读出来的原始值。
+随后是每次调用的记录：
 
-## 六、实测踩到的三个坑
+```
+seq=1234 tid=5678 params=000001F2... class=000001F2... outer=000001F2... name=0000000A0000002F flags70=00000000 result=000001F2... ret=00007FF6... classname=TextBlock
+```
+
+`class` / `outer` / `name` / `flags70` 都是从 `params` 里按偏移读出来的原始值；
+`classname` 是**消费线程**用名称池解出来的可读类名，在热路径之外完成，并按类指针做了缓存
+（只有约 2,000 个不同的类，所以每个指针只解一次）。
+
+同目录还会生成 `ue5hook.trace`——启动期的阶段面包屑。它和日志分开，是为了在 worker
+卡住、日志根本没建起来时仍能定位问题（本次开发中它两次直接指出了卡住的位置）。
+
+## 六、实测踩到的五个坑
 
 网上和专栏第 09 章都这么写卸载：
 
@@ -233,6 +318,29 @@ _snwprintf_s(header, ..., L"... section=%s", hits[0].section.c_str());  // ← �
 改用 `_wfsopen(path, mode, _SH_DENYNO)` 允许共享读。实测现在可以在游戏运行时
 `Get-Content` 日志。
 
+### 坑 4：`VirtualQuery` 比想象中贵得多
+
+第一版 `readable()` 每次访问都调 `VirtualQuery`。在这台目标上**单次约 65µs**——进程有 94
+个线程、VAD 树很大——而遍历 96,984 个对象每个要 6 次检查，于是光枚举就要 **37 秒**。
+
+改成**一次性快照整个地址空间的可读区**（`ue::buildRegionMap()`，几千次 `VirtualQuery`），
+之后每次检查是二分查找。整个发现 + 枚举降到约 350ms。
+
+代价说清楚：快照会过期，发现过程中新映射的内存看不到。对一次性启动扫描这是对的取舍——
+对象数组的 chunk 在注入之前早就映射好了。
+
+### 坑 5：暴力扫描 `Blocks` 数组慢了 90 倍
+
+名称池的第一版实现是「遍历 `.data` 的每个 qword，凡是长得像指针的就校验」。逻辑没错，但
+**约每 80 字节就有一个像指针的值**，5.4 MB 的 `.data` 意味着约 67,000 次校验，实测要
+**约 90 秒**。
+
+换成结构特征后是线性的：先找「几千个连续零 qword」的零串，再往回数非空指针。候选从
+67,000 降到个位数，耗时降到毫秒级。
+
+**教训**：一个「看起来对」的算法在 5 MB 输入上可能慢到不可用。而加进度埋点（每 1 MB 打
+一行）比盯着代码猜快得多——正是这个埋点让我看出它不是死循环，是慢。
+
 ## 七、已验证 / 未验证
 
 ### 已验证
@@ -258,23 +366,30 @@ _snwprintf_s(header, ..., L"... section=%s", hits[0].section.c_str());  // ← �
   例如 `0000000100024AD3` 即 Number=1）
 - `outer`、`result` 均为合法指针，`ret` 全部落在游戏模块内
 - 晚注入（35 秒，UE4SS 已 hook）走位移备选签名成功，RVA 仍是 `0x15C6C80`
+- **`GUObjectArray` 发现结果 `0x7FF63BBC4050` 与 UE4SS 日志的 `0x7ff63bbc4050` 完全一致**
+- 名称池发现成功，条目 0 解码为 `None`；布局探测判定为 `legacy`（非大小写保留）
+- 遍历 96,984 个对象，枚举出 4 个 `UWorld` 实例（含 CDO `Default__World`，以及
+  `StartingLevel` / `Login` / `Home` 三个真实地图），并产出合理的类名分布
+- 日志中的 `classname=` 输出为真实类名（`Image`、`TextBlock`、`HorizontalBoxSlot`、
+  `NotifyTextWidget_C` …）
 
 ### 未验证
 
-- `rcx` 运行时确实是 `&FStaticConstructObjectParameters`：**高置信但未证明**。
-  支持证据是 72k 次调用里 `class` 全部非空且只有 2360 个不同值（符合 `const UClass*`
-  的形态），但这是形态推断，不是证明。
-- 字段偏移 `0x00`/`0x08`/`0x10` 的**语义**：数值形态全部吻合（`0x00` 是类指针、
-  `0x08` 是 outer、`0x10` 是 FName），但**没有把任何一个 `name` 解码成字符串**，
-  所以严格说仍是「高度吻合」而非「已确认」。只有 `0x70` 由引擎自己的 prologue 直接证明存在。
-- 极少数记录（约 1/72423）的 `name` 高位出现异常大值，可能是走了不同的调用路径，
-  未追查。
+- **`rcx` 确实是 `&FStaticConstructObjectParameters`：已强证据支持，但仍非逐字节证明。**
+  现在证据比之前强得多：`params+0x00` 取出的指针喂给名称池能解出 `Image`、`TextBlock`、
+  `HorizontalBoxSlot` 这类真实类名，说明它确实是 `const UClass*`。这是「解出来的东西对」，
+  而不是「用调试器确认过结构体声明」。
+- **字段偏移 `0x08`（Outer）的语义未直接验证。** `0x00`（Class）和 `0x10`（Name）现在
+  都有了解码结果作证，`0x08` 只验证了「是个可读指针」，没验证「是 outer」。
+- 极少数记录（约 1/72423）的 `name` 高位出现异常大值，可能是走了不同的调用路径，未追查。
+- **`FUObjectArray` 只实现了默认布局。** 专栏列出的另外三种（UE5.8 dev、Back4Blood、
+  Multiversus）没有对应分支；校验失败时会报告未找到，而不是按错的布局读下去。
 
-**下一步**：把 `name` 解成字符串就能一锤定音。需要 `FNamePool` 基址，UE4SS 日志里已经
-给了 `FName::ToString: 0x7ff633d5b420`（RVA `0x138B420`）与 `GUObjectArray:
-0x7ff63bbc4050`，可以直接用。另外，取目标游戏对应版本的 `.usmap`（本例是 UE 5.6 的映射
-文件）可以确认结构体布局——那正是判定 `FStaticConstructObjectParameters` 各字段语义
-所需的东西。
+**下一步**：`.usmap`（本例是 UE 5.6 的映射文件）可以确认 `FStaticConstructObjectParameters`
+与 `UObject` 的逐字段布局，把上面两条从「形态吻合」升级成「已确认」。另一个方向是把
+`GWorld` / `GEngine` 也接上，以及按专栏第 08 章的路径 7 走玩家链
+（`UWorld → OwningGameInstance → LocalPlayers[0] → PlayerController`）——那些偏移在
+dump 出来的 SDK 里都有，不用扫特征码。
 
 ## 八、设计取舍（每条都对应一个会踩的坑）
 

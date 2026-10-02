@@ -51,6 +51,7 @@
 
 #include "async_log.h"
 #include "scan.h"
+#include "ue.h"
 
 namespace {
 
@@ -103,6 +104,11 @@ constexpr const char* kFallbackSignature =
     "8B 41 70 33 DB 49 89 73 10";
 constexpr uintptr_t kFallbackDisplacement = 14;
 
+// How far into StaticConstructObject_Internal to sweep for a reference to
+// GUObjectArray. The function is large -- its prologue reserves 0x2C0 bytes of
+// stack -- and the reference sits well past the entry.
+constexpr size_t kAnchorSweepBytes = 0x8000;
+
 // Offsets into FStaticConstructObjectParameters. The engine's own prologue
 // proves 0x70 exists; 0x00/0x08/0x10 follow the struct's declared field order
 // (Class, Outer, Name) and should be re-confirmed against your SDK dump before
@@ -121,6 +127,13 @@ using StaticConstructObjectFn = void*(__fastcall*)(void* params);
 StaticConstructObjectFn g_original = nullptr;
 void* g_target = nullptr;  // the resolved function address, needed for removal
 asynclog::Ring g_log;
+
+// Discovered once, then read-only. The consumer thread resolves names against
+// these; the detour itself never touches them.
+ue::ObjectArray g_objects;
+ue::NamePool g_names;
+
+std::string ResolveClassName(const void* cls) { return ue::classNameOf(g_names, cls); }
 std::atomic<uint64_t> g_calls{0};
 std::atomic<uint64_t> g_logged{0};
 std::atomic<uint64_t> g_limit{0};  // 0 = unlimited
@@ -170,6 +183,13 @@ void DebugPrint(const wchar_t* fmt, ...) {
     OutputDebugStringW(buf);
 }
 
+// Stage breadcrumb.
+//
+// Separate from the async logger on purpose: when the worker hangs or dies
+// before the logger exists, an injected DLL is otherwise completely silent, and
+// "no log file" cannot distinguish "not injected" from "stuck in discovery".
+// Each call opens, appends one line, and closes, so a partially written file
+// still shows how far execution got.
 std::wstring ReadEnv(const wchar_t* name, const std::wstring& fallback) {
     wchar_t buf[1024];
     const DWORD n = GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
@@ -183,6 +203,25 @@ std::wstring DirectoryOf(HMODULE module) {
     std::wstring s(path);
     const size_t slash = s.find_last_of(L"\\/");
     return slash == std::wstring::npos ? s : s.substr(0, slash);
+}
+
+// Stage breadcrumb.
+//
+// Separate from the async logger on purpose: when the worker hangs or dies
+// before the logger exists, an injected DLL is otherwise completely silent, and
+// "no log file" cannot distinguish "not injected" from "stuck in discovery".
+// Each call opens, appends one line, and closes, so a partially written file
+// still shows how far execution got.
+void Trace(const char* stage) {
+    const std::wstring path = DirectoryOf(g_self) + L"\\ue5hook.trace";
+    std::FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"a, ccs=UTF-8") == 0 && f != nullptr) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        std::fwprintf(f, L"%02u:%02u:%02u.%03u  %hs\n", st.wHour, st.wMinute, st.wSecond,
+                      st.wMilliseconds, stage);
+        std::fclose(f);
+    }
 }
 
 // Failure breadcrumb.
@@ -223,6 +262,8 @@ HMODULE ResolveTargetModule(std::wstring& nameOut) {
 // ---------------------------------------------------------------------------
 
 DWORD WINAPI Worker(LPVOID) {
+    Trace("worker: start");
+
     // Resolved first so every early return below can leave a breadcrumb.
     const std::wstring logPath = ReadEnv(L"UE5HOOK_LOG", DirectoryOf(g_self) + L"\\ue5hook.log");
 
@@ -232,6 +273,7 @@ DWORD WINAPI Worker(LPVOID) {
         Fail(logPath, L"target module not loaded: " + moduleName);
         return 1;
     }
+    Trace("worker: module resolved");
 
     const auto base = reinterpret_cast<const uint8_t*>(module);
 
@@ -289,19 +331,112 @@ DWORD WINAPI Worker(LPVOID) {
 
     g_target = target;
     const uintptr_t rva = reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(base);
+    Trace("worker: signature located");
+
+    // ---- anchors ----------------------------------------------------------
+    //
+    // Path 1 of the column: StaticConstructObject_Internal references
+    // GUObjectArray internally, so its own instruction stream is the way in --
+    // no AOB needed, and no bet on the array's layout, which is the part that
+    // actually varies between games.
+    //
+    // The name pool is found structurally instead: nothing guaranteed to be in
+    // this function points at it.
+    //
+    // Both are optional. Without them the hook still logs raw pointers; with
+    // them the log gains readable class names.
+    // Snapshot the address space before any discovery, so every guarded read
+    // after this is a binary search instead of a VirtualQuery.
+    ue::buildRegionMap();
+    Trace("worker: region map built");
+
+    g_objects = ue::findObjectArray(static_cast<const uint8_t*>(target), kAnchorSweepBytes);
+    Trace(g_objects.valid() ? "worker: GUObjectArray found" : "worker: GUObjectArray NOT found");
+
+    const ue::NamePoolScan nameScan = ue::findNamePool(base, &Trace);
+    g_names = nameScan.pool;
+    Trace(g_names.valid() ? "worker: name pool found" : "worker: name pool NOT found");
 
     // ---- logging ----------------------------------------------------------
-    wchar_t header[512];
+    const auto asRva = [base](const void* p) {
+        return static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p) -
+                                               reinterpret_cast<uintptr_t>(base));
+    };
+
+    wchar_t objectsLine[256];
+    if (g_objects.valid()) {
+        _snwprintf_s(objectsLine, _TRUNCATE,
+                     L"  GUObjectArray=0x%llX (RVA 0x%llX)  elements=%d  chunks=%d",
+                     static_cast<unsigned long long>(
+                         reinterpret_cast<uintptr_t>(g_objects.address)),
+                     asRva(g_objects.address), g_objects.numElements, g_objects.numChunks);
+    } else {
+        _snwprintf_s(objectsLine, _TRUNCATE, L"  GUObjectArray=not found");
+    }
+
+    wchar_t namesLine[256];
+    if (g_names.valid()) {
+        _snwprintf_s(namesLine, _TRUNCATE, L"  NamePool.blocks=0x%llX (RVA 0x%llX)  layout=%s",
+                     static_cast<unsigned long long>(
+                         reinterpret_cast<uintptr_t>(g_names.blocks)),
+                     asRva(g_names.blocks),
+                     g_names.shift == ue::NameLenShift::CasePreserving ? L"case-preserving"
+                                                                       : L"legacy");
+    } else {
+        _snwprintf_s(namesLine, _TRUNCATE,
+                     L"  NamePool=not found (scanned %zu of .data, %zu pointer candidates)",
+                     nameScan.sectionBytes, nameScan.candidatesExamined);
+    }
+
+    wchar_t header[1024];
     // %hs, not %s: in a wide printf %s means wchar_t*, and section is a
     // std::string. Passing it to %s reads ".text" as UTF-16 -- 0x742E, 0x7865,
     // 0x0074 -- and prints "琮硥t".
     _snwprintf_s(header, _TRUNCATE,
-                 L"# ue5hook  module=%s  RVA=0x%llX  section=%hs  via=%s", moduleName.c_str(),
-                 static_cast<unsigned long long>(rva), section.c_str(), which);
-    if (!g_log.start(logPath.c_str(), 1u << 16, header)) {
+                 L"# ue5hook  module=%s  RVA=0x%llX  section=%hs  via=%s\n%s\n%s",
+                 moduleName.c_str(), static_cast<unsigned long long>(rva), section.c_str(), which,
+                 objectsLine, namesLine);
+
+    if (!g_log.start(logPath.c_str(), 1u << 16, header,
+                     g_names.valid() ? &ResolveClassName : nullptr)) {
         Fail(logPath, L"cannot open log");
         return 1;
     }
+    Trace("worker: logger started");
+
+    // ---- demonstrate the anchors -----------------------------------------
+    //
+    // Enumerating UWorld instances exercises the whole chain at once: chunked
+    // array traversal, the UObject class offset, and FName decoding. If any one
+    // of them is wrong this finds nothing, or finds nonsense -- worth doing once
+    // at startup rather than trusting that the addresses merely "look right".
+    if (g_objects.valid() && g_names.valid()) {
+        const std::vector<ue::ObjectHit> worlds =
+            ue::findObjectsByClass(g_objects, g_names, "World", 4);
+        Trace("worker: enumerated UWorld");
+
+        wchar_t summary[256];
+        _snwprintf_s(summary, _TRUNCATE, L"  UWorld instances=%zu", worlds.size());
+        g_log.note(summary);
+
+        for (const ue::ObjectHit& w : worlds) {
+            wchar_t line[512];
+            _snwprintf_s(line, _TRUNCATE, L"    %hs  @%p",
+                         w.name.empty() ? "?" : w.name.c_str(), w.object);
+            g_log.note(line);
+        }
+
+        const std::vector<std::pair<std::string, int32_t>> histogram =
+            ue::classHistogram(g_objects, g_names, 10);
+        g_log.note(L"  most common classes:");
+        for (const std::pair<std::string, int32_t>& entry : histogram) {
+            wchar_t line[512];
+            _snwprintf_s(line, _TRUNCATE, L"    %6d  %hs", entry.second, entry.first.c_str());
+            g_log.note(line);
+        }
+        Trace("worker: class histogram done");
+    }
+
     {
         wchar_t limitBuf[64] = {};
         GetEnvironmentVariableW(L"UE5HOOK_LIMIT", limitBuf, 64);
